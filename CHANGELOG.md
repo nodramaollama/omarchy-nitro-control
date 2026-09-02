@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.1 - 2026-09-02
+
+- Stage a root-owned, no-follow, digest-verified release snapshot before any
+  privileged install reads.
+- Verify the exact privileged payload and every installed immutable artifact.
+- Add complete install rollback for files, service state, and DKMS state.
+- Require confirmed Automatic fan mode before uninstall can remove recovery
+  support; preserve support and request Maximum if confirmation fails.
+- Remove automatic privileged package-manager invocation; DKMS prerequisites
+  are now explicit manual setup.
+- Add UI process deadlines, response/output caps, closed model parsing, and
+  plain-text rendering.
+
 ## 1.0.0 - 2026-08-30
 
 - First public release.

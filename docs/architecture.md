@@ -19,6 +19,11 @@ kernel driver -> Acer firmware
 The panel displays temperatures, fan RPM, modes, and performance profiles. It
 cannot write to hardware by itself.
 
+Panel subprocesses have fixed deadlines and a cleared environment. `nitroctl`
+caps daemon input and UI output at 32 KiB. Parsed status is copied into a closed,
+size-bounded model rather than exposing arbitrary JSON properties, and all
+dynamic strings are rendered as plain text.
+
 ## 2. Safety service
 
 The root service accepts commands only from root or the exact Linux user ID
@@ -38,6 +43,20 @@ For manual mode it:
 
 If any step fails, it returns to Automatic. Maximum is the last cooling-safe
 fallback when Automatic cannot be confirmed.
+
+## Privileged setup transaction
+
+The installer treats the plugin checkout as untrusted after privilege is
+granted. It opens the reviewed payload with no-follow directory descriptors,
+checks the exact allowlist and immutable release digests, copies it to a
+root-owned `/run` snapshot, and performs all privileged reads from there.
+
+All replaced root files, service enablement/activity, and DKMS state are backed
+up before mutation. A failure restores that state. Successful installation
+rehashes every installed immutable artifact at its final destination. The
+installed root-owned uninstaller performs fail-safe hardware restoration before
+support is removed; an editable checkout cannot substitute privileged removal
+logic.
 
 ## 3. Kernel interface
 

@@ -1,32 +1,158 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
-project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly installed_dir=/usr/lib/nitro-control
+readonly installed_uninstaller=$installed_dir/uninstall
+
 if (( EUID != 0 )); then
-  exec sudo -- "$project_dir/uninstall"
+  [[ -x $installed_uninstaller && ! -L $installed_uninstaller ]] || {
+    echo "The verified root-owned Nitro Control uninstaller is unavailable." >&2
+    echo "Refusing to run uninstall code from the user-writable checkout as root." >&2
+    exit 1
+  }
+  exec sudo -- "$installed_uninstaller"
+fi
+if [[ $project_dir != $installed_dir ]]; then
+  [[ -x $installed_uninstaller && ! -L $installed_uninstaller ]] || {
+    echo "Refusing privileged uninstall from a user-writable checkout." >&2
+    exit 1
+  }
+  exec "$installed_uninstaller"
 fi
 
+readonly manifest=$installed_dir/release-manifest.sha256
 readonly driver_name=nitro-control-acer-wmi
 readonly driver_version=0.1.0
 readonly kernel=$(uname -r)
+readonly state_dir=/var/lib/nitro-control
 
-if [[ -x /usr/bin/nitroctl ]]; then
-  /usr/bin/nitroctl automatic >/dev/null 2>&1 || true
+[[ -f $manifest && ! -L $manifest ]] || {
+  echo "Installed release manifest is missing or unsafe." >&2
+  exit 1
+}
+expected_digest=$(awk '$2 == "uninstall" { print $1 }' "$manifest")
+actual_digest=$(sha256sum -- "$installed_uninstaller"); actual_digest=${actual_digest%% *}
+[[ -n $expected_digest && $actual_digest == "$expected_digest" ]] || {
+  echo "Installed uninstaller integrity check failed; refusing removal." >&2
+  exit 1
+}
+
+dmi_is_nitro() {
+  local vendor model
+  [[ -r /sys/class/dmi/id/sys_vendor && -r /sys/class/dmi/id/product_name ]] || return 1
+  vendor=$(< /sys/class/dmi/id/sys_vendor); model=$(< /sys/class/dmi/id/product_name)
+  [[ ${vendor,,} == acer && (${model,,} == nitro || ${model,,} == nitro\ *) ]]
+}
+
+restore_auto_confirmed() {
+  local hwmon path found=0 failed=0
+  dmi_is_nitro || return 0
+  for hwmon in /sys/class/hwmon/hwmon*; do
+    [[ -r $hwmon/name && $(<"$hwmon/name") == acer ]] || continue
+    [[ -e $hwmon/pwm1_enable && -e $hwmon/pwm2_enable ]] || continue
+    found=1
+    for path in "$hwmon"/pwm1_enable "$hwmon"/pwm2_enable; do
+      printf '2\n' >"$path" 2>/dev/null || failed=1
+    done
+    for path in "$hwmon"/pwm1_enable "$hwmon"/pwm2_enable; do
+      [[ -r $path && $(<"$path") == 2 ]] || failed=1
+    done
+  done
+  (( found == 1 && failed == 0 )) && return 0
+  for hwmon in /sys/class/hwmon/hwmon*; do
+    [[ -r $hwmon/name && $(<"$hwmon/name") == acer ]] || continue
+    for path in "$hwmon"/pwm1_enable "$hwmon"/pwm2_enable; do
+      [[ -w $path ]] && printf '0\n' >"$path" || true
+    done
+  done
+  return 1
+}
+
+has_pwm_control() {
+  local hwmon
+  for hwmon in /sys/class/hwmon/hwmon*; do
+    [[ -r $hwmon/name && $(<"$hwmon/name") == acer ]] || continue
+    [[ -e $hwmon/pwm1_enable && -e $hwmon/pwm2_enable ]] && return 0
+  done
+  return 1
+}
+
+control_was_installed=0
+[[ -f $state_dir/control-installed || -f $state_dir/driver-installed ]] && \
+  control_was_installed=1
+has_pwm_control && control_was_installed=1
+
+if (( control_was_installed )); then
+  if [[ -x /usr/bin/nitroctl ]]; then
+    /usr/bin/nitroctl automatic >/dev/null || \
+      echo "Backend automatic request failed; checking hardware directly." >&2
+  fi
+  restore_auto_confirmed || {
+    echo "Automatic fan mode could not be confirmed." >&2
+    echo "Maximum cooling was requested; system support was NOT removed." >&2
+    exit 1
+  }
 fi
-systemctl disable --now nitro-control.service 2>/dev/null || true
 
-if [[ -f /var/lib/nitro-control/driver-installed ]] && \
-   grep -qx "$driver_name/$driver_version" /var/lib/nitro-control/driver-installed; then
-  if [[ -d /sys/module/acer_wmi && $(< /sys/module/acer_wmi/refcnt) == 0 ]]; then
+service_was_active=0
+if systemctl is-active --quiet nitro-control.service; then
+  service_was_active=1
+  systemctl stop nitro-control.service
+fi
+if (( control_was_installed )) && ! restore_auto_confirmed; then
+  echo "Automatic mode was lost while stopping the service; removal aborted." >&2
+  (( service_was_active == 0 )) || systemctl start nitro-control.service 2>/dev/null || true
+  exit 1
+fi
+
+if [[ -f $state_dir/driver-installed ]] && \
+   grep -qx "$driver_name/$driver_version" "$state_dir/driver-installed"; then
+  if [[ -d /sys/module/acer_wmi ]]; then
+    [[ $(< /sys/module/acer_wmi/refcnt) == 0 ]] || {
+      echo "acer_wmi is busy; removal aborted before deleting support files." >&2
+      (( service_was_active == 0 )) || systemctl start nitro-control.service 2>/dev/null || true
+      exit 1
+    }
     modprobe -r acer_wmi
   fi
-  dkms remove -m "$driver_name" -v "$driver_version" --all
-  rm -rf -- "/usr/src/${driver_name}-${driver_version}"
+  if ! dkms remove -m "$driver_name" -v "$driver_version" --all; then
+    modprobe acer_wmi 2>/dev/null || true
+    (( service_was_active == 0 )) || systemctl start nitro-control.service 2>/dev/null || true
+    echo "DKMS removal failed; system support files were preserved." >&2
+    exit 1
+  fi
   depmod "$kernel"
-  modprobe acer_wmi
+  if ! modprobe acer_wmi; then
+    echo "Upstream acer_wmi failed; attempting to restore the fallback." >&2
+    dkms install -m "$driver_name" -v "$driver_version" -k "$kernel" 2>/dev/null || true
+    depmod "$kernel" 2>/dev/null || true
+    modprobe acer_wmi 2>/dev/null || true
+    (( service_was_active == 0 )) || systemctl start nitro-control.service 2>/dev/null || true
+    echo "Driver transition failed; system support files were preserved." >&2
+    exit 1
+  fi
+  restore_auto_confirmed || {
+    echo "Automatic mode could not be confirmed after restoring upstream acer_wmi." >&2
+    dkms install -m "$driver_name" -v "$driver_version" -k "$kernel" 2>/dev/null || true
+    depmod "$kernel" 2>/dev/null || true
+    modprobe -r acer_wmi 2>/dev/null || true
+    modprobe acer_wmi 2>/dev/null || true
+    restore_auto_confirmed 2>/dev/null || true
+    (( service_was_active == 0 )) || systemctl start nitro-control.service 2>/dev/null || true
+    echo "Fallback recovery was attempted; system support files were preserved." >&2
+    exit 1
+  }
+  rm -rf -- "/usr/src/${driver_name}-${driver_version}"
 fi
 
+if ! systemctl disable nitro-control.service; then
+  (( service_was_active == 0 )) || systemctl start nitro-control.service 2>/dev/null || true
+  echo "Could not disable the service; system support files were preserved." >&2
+  exit 1
+fi
 rm -f -- /etc/systemd/system/nitro-control.service /etc/nitro-control.conf /usr/bin/nitroctl
-rm -rf -- /usr/lib/nitro-control /var/lib/nitro-control
+rm -rf -- "$state_dir" "$installed_dir"
 systemctl daemon-reload
-echo "Nitro Control backend removed; the fans are under firmware control."
+echo "Nitro Control removed after firmware automatic fan control was confirmed."

@@ -1,30 +1,192 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
-project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-
-if (( EUID != 0 )); then
-  exec sudo -- "$project_dir/install" --target-user "${USER:?}"
-fi
+project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly manifest_name=release-manifest.sha256
+readonly snapshot_prefix=/run/nitro-control-install.
 
 target_user=
+verify_release=0
 while (( $# > 0 )); do
   case "$1" in
-    --target-user)
-      target_user=${2:-}
-      shift 2
-      ;;
-    *)
-      echo "Unknown option: $1" >&2
-      exit 2
-      ;;
+    --target-user) target_user=${2:-}; shift 2 ;;
+    --verify-release) verify_release=1; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
+
+if (( EUID != 0 )); then
+  target_user=${target_user:-${USER:-}}
+  [[ -n $target_user && $target_user != root ]] || {
+    echo "Could not determine the desktop user safely." >&2
+    exit 1
+  }
+  [[ -f $project_dir/$manifest_name && ! -L $project_dir/$manifest_name ]] || {
+    echo "The release manifest is missing or unsafe." >&2
+    exit 1
+  }
+  frozen_manifest=$(<"$project_dir/$manifest_name")
+  (( ${#frozen_manifest} <= 65536 )) || {
+    echo "The release manifest is too large." >&2
+    exit 1
+  }
+
+  # Both the bootstrap program and expected digest set become immutable argv
+  # values before sudo asks for consent. Root therefore never executes or
+  # trusts code read later from the user-writable checkout.
+  IFS= read -r -d '' root_stager <<'PY' || :
+import hashlib
+import os
+import re
+import shutil
+import stat
+import sys
+import tempfile
+
+source, target_user, verify_release, manifest_text = sys.argv[1:]
+expected_paths = {
+    "install", "uninstall", "backend/nitro_control.py", "bin/nitroctl",
+    "driver/select_verified_driver.py", "driver/verified-models.json",
+    "driver/acer-wmi-anv16-0.1.0/SHA256SUMS",
+    "driver/acer-wmi-anv16-0.1.0/Makefile",
+    "driver/acer-wmi-anv16-0.1.0/acer-wmi.c",
+    "driver/acer-wmi-anv16-0.1.0/dkms.conf",
+    "systemd/nitro-control.service",
+}
+executables = {
+    "install", "uninstall", "backend/nitro_control.py", "bin/nitroctl",
+    "driver/select_verified_driver.py",
+}
+destination = tempfile.mkdtemp(prefix="nitro-control-install.", dir="/run")
+os.chmod(destination, 0o700)
+root_fd = None
+
+def open_beneath(relative):
+    parts = relative.split("/")
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise RuntimeError(f"unsafe release path: {relative!r}")
+    current = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=current)
+            os.close(current)
+            current = following
+        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)
+    finally:
+        os.close(current)
+
+try:
+    manifest_bytes = manifest_text.encode("ascii") + b"\n"
+    if len(manifest_bytes) > 65536:
+        raise RuntimeError("release manifest is too large")
+    digests = {}
+    for line in manifest_text.splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._/-]+)", line)
+        if not match:
+            raise RuntimeError(f"invalid release manifest line: {line!r}")
+        digest, path = match.groups()
+        if path in digests:
+            raise RuntimeError(f"duplicate release manifest path: {path}")
+        digests[path] = digest
+    if set(digests) != expected_paths:
+        missing = sorted(expected_paths - set(digests))
+        extra = sorted(set(digests) - expected_paths)
+        raise RuntimeError(
+            f"release manifest coverage mismatch; missing={missing}, extra={extra}"
+        )
+
+    root_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    for relative in sorted(expected_paths):
+        source_fd = open_beneath(relative)
+        try:
+            before = os.fstat(source_fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise RuntimeError(f"source is not a single-link regular file: {relative}")
+            target = os.path.join(destination, *relative.split("/"))
+            os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+            target_fd = os.open(
+                target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o500 if relative in executables else 0o400,
+            )
+            digest = hashlib.sha256()
+            try:
+                while True:
+                    chunk = os.read(source_fd, 131072)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(target_fd, view):]
+                os.fsync(target_fd)
+            finally:
+                os.close(target_fd)
+            after = os.fstat(source_fd)
+            stable = (
+                before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            ) == (
+                after.st_dev, after.st_ino, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            )
+            if not stable:
+                raise RuntimeError(f"source changed while staging: {relative}")
+            if digest.hexdigest() != digests[relative]:
+                raise RuntimeError(f"release digest mismatch: {relative}")
+        finally:
+            os.close(source_fd)
+
+    manifest_target = os.path.join(destination, "release-manifest.sha256")
+    manifest_out = os.open(
+        manifest_target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400
+    )
+    try:
+        os.write(manifest_out, manifest_bytes)
+        os.fsync(manifest_out)
+    finally:
+        os.close(manifest_out)
+    os.close(root_fd)
+    root_fd = None
+
+    installer = os.path.join(destination, "install")
+    arguments = [installer, "--target-user", target_user]
+    if verify_release == "1":
+        arguments.append("--verify-release")
+    os.execve(
+        installer,
+        arguments,
+        {
+            "HOME": "/root", "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+            "NITRO_INSTALL_SNAPSHOT": "1",
+        },
+    )
+except BaseException:
+    if root_fd is not None:
+        os.close(root_fd)
+    shutil.rmtree(destination, ignore_errors=True)
+    raise
+PY
+  exec sudo -- /usr/bin/python3 -I -c "$root_stager" \
+    "$project_dir" "$target_user" "$verify_release" "$frozen_manifest"
+fi
+
+[[ ${NITRO_INSTALL_SNAPSHOT:-} == 1 && $project_dir == ${snapshot_prefix}* && \
+   -O $project_dir && ! -L $project_dir && $(stat -c %a -- "$project_dir") == 700 ]] || {
+  echo "Refusing privileged installation outside a verified root-owned snapshot." >&2
+  exit 1
+}
 
 target_user=${target_user:-${SUDO_USER:-}}
 if [[ -z $target_user || $target_user == root ]] || ! id "$target_user" >/dev/null 2>&1; then
   echo "Could not determine the desktop user safely." >&2
   exit 1
+fi
+if (( verify_release )); then
+  rm -rf -- "$project_dir"
+  echo "Release payload verified in a root-owned no-follow snapshot."
+  exit 0
 fi
 
 readonly kernel=$(uname -r)
@@ -33,50 +195,116 @@ readonly access_uid=$(id -u "$target_user")
 readonly library_dir=/usr/lib/nitro-control
 readonly config_file=/etc/nitro-control.conf
 readonly state_dir=/var/lib/nitro-control
+readonly service_file=/etc/systemd/system/nitro-control.service
+readonly client_file=/usr/bin/nitroctl
 readonly driver_name=nitro-control-acer-wmi
 readonly driver_version=0.1.0
 readonly driver_source="$project_dir/driver/acer-wmi-anv16-0.1.0"
 readonly dkms_source="/usr/src/${driver_name}-${driver_version}"
 
-driver_added=0
+backup_dir=$(mktemp -d /run/nitro-control-rollback.XXXXXX)
+transaction_started=0
+driver_touched=0
 driver_installed=0
+library_new=
+client_new=
+service_new=
+config_new=
+previous_enabled=$(systemctl is-enabled nitro-control.service 2>/dev/null || true)
+previous_active=$(systemctl is-active nitro-control.service 2>/dev/null || true)
+declare -a backed_up=()
+
+safe_remove_snapshot() {
+  [[ $project_dir == ${snapshot_prefix}* && -d $project_dir && ! -L $project_dir ]] && \
+    rm -rf -- "$project_dir"
+}
+
+backup_path() {
+  local id=$1 path=$2
+  if [[ -e $path || -L $path ]]; then
+    [[ ! -L $path ]] || { echo "Refusing privileged symlink: $path" >&2; exit 1; }
+    cp -a -- "$path" "$backup_dir/$id"
+    backed_up+=("$id:$path")
+  fi
+}
+
+restore_backups() {
+  local entry id path
+  rm -rf -- "$library_dir" "$state_dir"
+  rm -f -- "$config_file" "$service_file" "$client_file"
+  for entry in "${backed_up[@]}"; do
+    id=${entry%%:*}; path=${entry#*:}
+    cp -a -- "$backup_dir/$id" "$path"
+  done
+}
+
+cleanup_temporary_artifacts() {
+  [[ -z $library_new || $library_new == /usr/lib/.nitro-control.new.* ]] && \
+    { [[ -z $library_new ]] || rm -rf -- "$library_new"; }
+  [[ -z $client_new || $client_new == /usr/bin/.nitroctl.new.* ]] && \
+    { [[ -z $client_new ]] || rm -f -- "$client_new"; }
+  [[ -z $service_new || $service_new == /etc/systemd/system/.nitro-control.service.new.* ]] && \
+    { [[ -z $service_new ]] || rm -f -- "$service_new"; }
+  [[ -z $config_new || $config_new == /etc/.nitro-control.conf.new.* ]] && \
+    { [[ -z $config_new ]] || rm -f -- "$config_new"; }
+}
 
 dmi_is_nitro() {
   local vendor model
   [[ -r /sys/class/dmi/id/sys_vendor && -r /sys/class/dmi/id/product_name ]] || return 1
-  vendor=$(< /sys/class/dmi/id/sys_vendor)
-  model=$(< /sys/class/dmi/id/product_name)
+  vendor=$(< /sys/class/dmi/id/sys_vendor); model=$(< /sys/class/dmi/id/product_name)
   [[ ${vendor,,} == acer && (${model,,} == nitro || ${model,,} == nitro\ *) ]]
 }
 
-restore_auto_direct() {
-  local hwmon path
+restore_auto_confirmed() {
+  local hwmon path found=0 failed=0
   dmi_is_nitro || return 0
   for hwmon in /sys/class/hwmon/hwmon*; do
-    [[ -r $hwmon/name ]] || continue
-    [[ $(<"$hwmon/name") == acer ]] || continue
+    [[ -r $hwmon/name && $(<"$hwmon/name") == acer ]] || continue
+    [[ -e $hwmon/pwm1_enable && -e $hwmon/pwm2_enable ]] || continue
+    found=1
     for path in "$hwmon"/pwm1_enable "$hwmon"/pwm2_enable; do
-      [[ -w $path ]] && printf '2\n' >"$path" || true
+      printf '2\n' >"$path" 2>/dev/null || failed=1
+    done
+    for path in "$hwmon"/pwm1_enable "$hwmon"/pwm2_enable; do
+      [[ -r $path && $(<"$path") == 2 ]] || failed=1
     done
   done
+  (( found == 0 || failed == 0 )) && return 0
+  for hwmon in /sys/class/hwmon/hwmon*; do
+    [[ -r $hwmon/name && $(<"$hwmon/name") == acer ]] || continue
+    for path in "$hwmon"/pwm1_enable "$hwmon"/pwm2_enable; do
+      [[ -w $path ]] && printf '0\n' >"$path" || true
+    done
+  done
+  return 1
 }
 
 rollback() {
   local status=$?
   trap - EXIT INT TERM HUP
-  restore_auto_direct
-  if (( status != 0 )); then
-    echo "Installation failed; restoring automatic fan control." >&2
+  if (( status != 0 && transaction_started )); then
+    echo "Installation failed; rolling back every privileged artifact." >&2
     systemctl stop nitro-control.service 2>/dev/null || true
+    restore_auto_confirmed || echo "WARNING: automatic fan mode could not be confirmed." >&2
     if (( driver_installed )) && [[ -d /sys/module/acer_wmi ]]; then
-      rmmod acer_wmi 2>/dev/null || true
+      modprobe -r acer_wmi 2>/dev/null || true
     fi
-    if (( driver_added )); then
+    if (( driver_touched )); then
       dkms remove -m "$driver_name" -v "$driver_version" --all 2>/dev/null || true
-      depmod "$kernel" || true
+      rm -rf -- "$dkms_source"
+      depmod "$kernel" 2>/dev/null || true
       modprobe acer_wmi 2>/dev/null || true
     fi
+    restore_backups
+    systemctl daemon-reload 2>/dev/null || true
+    [[ $previous_enabled == enabled ]] && systemctl enable nitro-control.service 2>/dev/null || true
+    [[ $previous_enabled == disabled ]] && systemctl disable nitro-control.service 2>/dev/null || true
+    [[ $previous_active == active ]] && systemctl start nitro-control.service 2>/dev/null || true
   fi
+  cleanup_temporary_artifacts
+  rm -rf -- "$backup_dir"
+  safe_remove_snapshot
   exit "$status"
 }
 trap rollback EXIT INT TERM HUP
@@ -84,114 +312,157 @@ trap rollback EXIT INT TERM HUP
 has_pwm_control() {
   local hwmon
   for hwmon in /sys/class/hwmon/hwmon*; do
-    [[ -r $hwmon/name ]] || continue
-    [[ $(<"$hwmon/name") == acer ]] || continue
+    [[ -r $hwmon/name && $(<"$hwmon/name") == acer ]] || continue
     [[ -e $hwmon/pwm1_enable && -e $hwmon/pwm2_enable ]] && return 0
   done
   return 1
 }
 
+manifest_digest() {
+  awk -v path="$1" '$2 == path { print $1 }' "$project_dir/$manifest_name"
+}
+
+verify_copy() {
+  local relative=$1 destination=$2 mode=$3 expected actual metadata
+  [[ -f $destination && ! -L $destination ]] || {
+    echo "Installed artifact is not a no-follow regular file: $destination" >&2; return 1;
+  }
+  expected=$(manifest_digest "$relative")
+  actual=$(sha256sum -- "$destination"); actual=${actual%% *}
+  [[ -n $expected && $actual == "$expected" ]] || {
+    echo "Installed artifact digest mismatch: $destination" >&2; return 1;
+  }
+  metadata=$(stat -c '%U:%G:%a' -- "$destination")
+  [[ $metadata == "root:root:$mode" ]] || {
+    echo "Installed artifact metadata mismatch: $destination ($metadata)" >&2; return 1;
+  }
+}
+
 verified_driver_package() {
-  local vendor=$1 model=$2 running_kernel=$3 bios=$4
-  python3 "$project_dir/driver/select_verified_driver.py" \
-    "$project_dir/driver/verified-models.json" \
-    "$vendor" "$model" "$running_kernel" "$bios"
+  python3 -I "$project_dir/driver/select_verified_driver.py" \
+    "$project_dir/driver/verified-models.json" "$1" "$2" "$3" "$4"
 }
 
 install_driver_if_needed() {
-  local vendor model bios pkgbase verified_package verification_status
-
+  local vendor model bios pkgbase verified_package verification_status relative file
   has_pwm_control && return 0
-  vendor=$(< /sys/class/dmi/id/sys_vendor)
-  model=$(< /sys/class/dmi/id/product_name)
+  vendor=$(< /sys/class/dmi/id/sys_vendor); model=$(< /sys/class/dmi/id/product_name)
   bios=$(< /sys/class/dmi/id/bios_version)
-  if verified_package=$(verified_driver_package "$vendor" "$model" "$kernel" "$bios"); then
-    :
-  else
+  if verified_package=$(verified_driver_package "$vendor" "$model" "$kernel" "$bios"); then :; else
     verification_status=$?
     if (( verification_status == 3 )); then
-      echo "The bundled driver was not tested with this exact kernel and BIOS:" >&2
-      echo "  $vendor $model · kernel $kernel · BIOS $bios" >&2
-      echo "The plugin will install read-only; fan writes remain disabled." >&2
+      echo "Bundled driver not tested for: $vendor $model · kernel $kernel · BIOS $bios" >&2
+      echo "Installing read-only support." >&2
       return 0
     fi
-    echo "Could not verify the bundled driver registry." >&2
-    exit "$verification_status"
+    return "$verification_status"
   fi
-  if [[ -z $verified_package ]]; then
-    echo "No native PWM interface and no verified fallback for: $vendor $model" >&2
-    echo "The read-only plugin will still install; fan writes remain disabled." >&2
-    return 0
-  fi
-  if [[ $verified_package != "acer-wmi-anv16-0.1.0" ]]; then
-    echo "The compatibility registry names an unknown driver package: $verified_package" >&2
-    exit 1
-  fi
-
-  if ! (cd -- "$driver_source" && sha256sum --check --strict SHA256SUMS); then
-    echo "The bundled driver files failed their checksum verification." >&2
-    exit 1
-  fi
+  [[ -n $verified_package ]] || { echo "No verified fallback; installing read-only." >&2; return 0; }
+  [[ $verified_package == acer-wmi-anv16-0.1.0 ]] || return 1
+  (cd -- "$driver_source" && sha256sum --check --strict SHA256SUMS)
 
   pkgbase=$(<"/usr/lib/modules/$kernel/pkgbase")
-  if ! command -v dkms >/dev/null || [[ ! -d /usr/lib/modules/$kernel/build ]]; then
-    pacman -S --needed --noconfirm dkms "${pkgbase}-headers"
-  fi
-
+  command -v dkms >/dev/null && [[ -d /usr/lib/modules/$kernel/build ]] || {
+    echo "Install prerequisites first: omarchy pkg add dkms ${pkgbase}-headers" >&2
+    return 1
+  }
   if dkms status -m "$driver_name" 2>/dev/null | grep -q . || [[ -e $dkms_source ]]; then
-    echo "$driver_name/$driver_version already exists; refusing to overwrite it." >&2
-    exit 1
+    echo "$driver_name/$driver_version already exists; refusing overwrite." >&2
+    return 1
   fi
-
+  driver_touched=1
   install -d -m 0755 "$dkms_source"
-  install -m 0644 \
-    "$driver_source/acer-wmi.c" \
-    "$driver_source/Makefile" \
-    "$driver_source/dkms.conf" \
-    "$dkms_source/"
+  for file in acer-wmi.c Makefile dkms.conf; do
+    install -m 0644 "$driver_source/$file" "$dkms_source/$file"
+    relative="driver/acer-wmi-anv16-0.1.0/$file"
+    verify_copy "$relative" "$dkms_source/$file" 644
+  done
   dkms add -m "$driver_name" -v "$driver_version"
-  driver_added=1
   dkms build -m "$driver_name" -v "$driver_version" -k "$kernel"
-  dkms install -m "$driver_name" -v "$driver_version" -k "$kernel"
-  driver_installed=1
+  dkms install -m "$driver_name" -v "$driver_version" -k "$kernel"; driver_installed=1
   depmod "$kernel"
-
   [[ ! -d /sys/module/acer_wmi || $(< /sys/module/acer_wmi/refcnt) == 0 ]]
-  modprobe -r acer_wmi 2>/dev/null || true
+  [[ ! -d /sys/module/acer_wmi ]] || modprobe -r acer_wmi
   modprobe acer_wmi
   has_pwm_control
   install -d -m 0755 "$state_dir"
   printf '%s/%s\n' "$driver_name" "$driver_version" >"$state_dir/driver-installed"
+  chmod 0600 "$state_dir/driver-installed"
 }
 
+backup_path library "$library_dir"; backup_path config "$config_file"
+backup_path state "$state_dir"; backup_path client "$client_file"
+backup_path service "$service_file"; transaction_started=1
+
+restore_auto_confirmed || { echo "Cannot confirm automatic fan mode; refusing install." >&2; exit 1; }
+systemctl stop nitro-control.service 2>/dev/null || [[ $previous_active != active ]]
 install_driver_if_needed
-restore_auto_direct
+restore_auto_confirmed || { echo "Automatic fan mode lost after driver setup." >&2; exit 1; }
 
-systemctl stop nitro-control.service 2>/dev/null || true
-install -d -m 0755 "$library_dir"
-install -m 0755 "$project_dir/backend/nitro_control.py" "$library_dir/nitro_control.py"
-install -m 0644 "$project_dir/driver/verified-models.json" "$library_dir/verified-models.json"
-install -m 0755 "$project_dir/bin/nitroctl" /usr/bin/nitroctl
-install -m 0644 "$project_dir/systemd/nitro-control.service" /etc/systemd/system/nitro-control.service
-install -d -m 0755 "$state_dir"
+library_new=$(mktemp -d /usr/lib/.nitro-control.new.XXXXXX)
+chmod 0755 "$library_new"
+install -m 0755 "$project_dir/backend/nitro_control.py" "$library_new/nitro_control.py"
+install -m 0644 "$project_dir/driver/verified-models.json" "$library_new/verified-models.json"
+install -m 0755 "$project_dir/uninstall" "$library_new/uninstall"
+install -m 0400 "$project_dir/$manifest_name" "$library_new/$manifest_name"
+verify_copy backend/nitro_control.py "$library_new/nitro_control.py" 755
+verify_copy driver/verified-models.json "$library_new/verified-models.json" 644
+verify_copy uninstall "$library_new/uninstall" 755
+rm -rf -- "$library_dir"; mv -T -- "$library_new" "$library_dir"; library_new=
 
+client_new=$(mktemp /usr/bin/.nitroctl.new.XXXXXX)
+install -m 0755 "$project_dir/bin/nitroctl" "$client_new"
+verify_copy bin/nitroctl "$client_new" 755; mv -T -- "$client_new" "$client_file"; client_new=
+service_new=$(mktemp /etc/systemd/system/.nitro-control.service.new.XXXXXX)
+install -m 0644 "$project_dir/systemd/nitro-control.service" "$service_new"
+verify_copy systemd/nitro-control.service "$service_new" 644
+mv -T -- "$service_new" "$service_file"; service_new=
+
+config_new=$(mktemp /etc/.nitro-control.conf.new.XXXXXX)
 {
   printf 'NITRO_CONTROL_GROUP=%q\n' "$access_group"
   printf 'NITRO_CONTROL_UID=%q\n' "$access_uid"
   printf 'NITRO_CONTROL_MANUAL_TIMEOUT=12\n'
-} >"$config_file"
-chmod 0644 "$config_file"
+} >"$config_new"
+chmod 0644 "$config_new"; mv -T -- "$config_new" "$config_file"; config_new=
+install -d -m 0755 "$state_dir"
+if has_pwm_control; then
+  printf 'enabled\n' >"$state_dir/control-installed"
+  chmod 0600 "$state_dir/control-installed"
+fi
+
+verify_copy backend/nitro_control.py "$library_dir/nitro_control.py" 755
+verify_copy driver/verified-models.json "$library_dir/verified-models.json" 644
+verify_copy uninstall "$library_dir/uninstall" 755
+verify_copy bin/nitroctl "$client_file" 755
+verify_copy systemd/nitro-control.service "$service_file" 644
+[[ $(stat -c '%U:%G:%a' -- "$library_dir") == root:root:755 ]]
+[[ $(stat -c '%U:%G:%a' -- "$library_dir/$manifest_name") == root:root:400 ]]
+cmp -s -- "$project_dir/$manifest_name" "$library_dir/$manifest_name"
+[[ $(stat -c '%U:%G:%a' -- "$config_file") == root:root:644 ]]
+[[ $(stat -c '%U:%G:%a' -- "$state_dir") == root:root:755 ]]
+[[ $(wc -l <"$config_file") == 3 ]]
+grep -qxF "NITRO_CONTROL_GROUP=$(printf %q "$access_group")" "$config_file"
+grep -qxF "NITRO_CONTROL_UID=$(printf %q "$access_uid")" "$config_file"
+grep -qxF 'NITRO_CONTROL_MANUAL_TIMEOUT=12' "$config_file"
+if [[ -f $state_dir/driver-installed ]]; then
+  [[ $(stat -c '%U:%G:%a' -- "$state_dir/driver-installed") == root:root:600 ]]
+  grep -qxF "$driver_name/$driver_version" "$state_dir/driver-installed"
+fi
+if [[ -f $state_dir/control-installed ]]; then
+  [[ $(stat -c '%U:%G:%a' -- "$state_dir/control-installed") == root:root:600 ]]
+  grep -qxF enabled "$state_dir/control-installed"
+fi
 
 systemctl daemon-reload
 systemctl enable --now nitro-control.service
-
-for _attempt in 1 2 3 4 5; do
-  [[ -S /run/nitro-control/control.sock ]] && break
-  sleep 1
-done
+for _attempt in 1 2 3 4 5; do [[ -S /run/nitro-control/control.sock ]] && break; sleep 1; done
 [[ -S /run/nitro-control/control.sock ]]
 runuser -u "$target_user" -- /usr/bin/nitroctl status >/dev/null
+restore_auto_confirmed
 
+transaction_started=0
+rm -rf -- "$backup_dir"; safe_remove_snapshot
 trap - EXIT INT TERM HUP
-echo "Nitro Control backend installed for $target_user."
-echo "The fans are in firmware automatic mode."
+echo "Nitro Control installed from a verified root-owned snapshot."
+echo "Firmware automatic fan mode is confirmed."

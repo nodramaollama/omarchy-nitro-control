@@ -7,8 +7,23 @@ import argparse
 import json
 import socket
 import sys
+import time
 from pathlib import Path
 from typing import Any
+
+
+MAX_RESPONSE_BYTES = 32768
+MAX_OUTPUT_BYTES = 32768
+MAX_ERROR_CHARS = 512
+TOTAL_REQUEST_SECONDS = 4.0
+
+
+def bounded_plain_text(value: object, limit: int = MAX_ERROR_CHARS) -> str:
+    text = "".join(
+        " " if ord(character) < 32 or 127 <= ord(character) <= 159 else character
+        for character in str(value)
+    )
+    return " ".join(text.split()).replace("<", "").replace(">", "").replace("&", "")[:limit]
 
 
 def load_hardware_class():
@@ -27,17 +42,27 @@ def load_hardware_class():
 
 def send_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
     payload = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+    deadline = time.monotonic() + TOTAL_REQUEST_SECONDS
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(3.0)
+        client.settimeout(TOTAL_REQUEST_SECONDS)
         client.connect(str(socket_path))
         client.sendall(payload)
         raw = b""
-        while b"\n" not in raw and len(raw) <= 65536:
-            chunk = client.recv(4096)
+        while b"\n" not in raw and len(raw) <= MAX_RESPONSE_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("backend response deadline exceeded")
+            client.settimeout(remaining)
+            chunk = client.recv(min(4096, MAX_RESPONSE_BYTES + 1 - len(raw)))
             if not chunk:
                 break
             raw += chunk
-    response = json.loads(raw.decode("utf-8"))
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise ValueError("backend response exceeded safety limit")
+    line, separator, trailing = raw.partition(b"\n")
+    if not separator or trailing:
+        raise ValueError("backend returned an incomplete or trailing response")
+    response = json.loads(line.decode("utf-8"))
     if not isinstance(response, dict):
         raise RuntimeError("backend returned an invalid response")
     return response
@@ -48,7 +73,7 @@ def readonly_status(error: Exception | None = None) -> dict[str, Any]:
         status = load_hardware_class()().status()
         status.update({"ok": True, "backend": "missing"})
         if error is not None:
-            status["backendError"] = str(error)
+            status["backendError"] = bounded_plain_text(error)
         return status
     except Exception as exc:  # status must remain useful during incomplete setup
         return {
@@ -56,7 +81,7 @@ def readonly_status(error: Exception | None = None) -> dict[str, Any]:
             "backend": "missing",
             "sensorAvailable": False,
             "controlAvailable": False,
-            "error": str(exc),
+            "error": bounded_plain_text(exc),
         }
 
 
@@ -101,9 +126,17 @@ def main() -> int:
         if action == "status":
             response = readonly_status(exc)
         else:
-            response = {"ok": False, "backend": "missing", "error": f"backend unavailable: {exc}"}
+            response = {
+                "ok": False,
+                "backend": "missing",
+                "error": bounded_plain_text(f"backend unavailable: {exc}"),
+            }
 
-    print(json.dumps(response, indent=2 if args.pretty else None, sort_keys=args.pretty))
+    output = json.dumps(response, indent=2 if args.pretty else None, sort_keys=args.pretty)
+    if len(output.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        output = json.dumps({"ok": False, "error": "client output exceeded safety limit"})
+        response = {"ok": False}
+    print(output)
     return 0 if response.get("ok") else 1
 
 

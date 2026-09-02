@@ -6,11 +6,12 @@ import tempfile
 import time
 import unittest
 import grp
+import json
 import os
 import socket
 import struct
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import sys
 
@@ -174,6 +175,33 @@ class NitroPeerAuthenticationTests(unittest.TestCase):
         for uid, expected in ((0, True), (access_uid, True), (4243, False)):
             connection.getsockopt.return_value = struct.pack("3i", 123, uid, os.getgid())
             self.assertEqual(daemon._peer_allowed(connection), expected)
+
+
+class NitroProtocolBoundsTests(unittest.TestCase):
+    def test_response_is_capped_even_if_hardware_data_is_hostile(self) -> None:
+        response = NitroDaemon._encoded_response(
+            {"model": "x" * (NitroDaemon.MAX_RESPONSE_BYTES * 2)}
+        )
+        self.assertLessEqual(len(response), NitroDaemon.MAX_RESPONSE_BYTES)
+        self.assertEqual(
+            response,
+            b'{"ok":false,"error":"backend response exceeded safety limit"}\n',
+        )
+
+    def test_incomplete_request_has_a_total_deadline(self) -> None:
+        group_name = grp.getgrgid(os.getgid()).gr_name
+        daemon = NitroDaemon(
+            Mock(), Path("/tmp/not-used.sock"), group_name, os.getuid(), 12
+        )
+        daemon.TOTAL_REQUEST_SECONDS = 0.01
+        daemon._peer_allowed = Mock(return_value=True)
+        connection = Mock(spec=socket.socket)
+        connection.recv.return_value = b"x"
+        with patch("nitro_control.time.monotonic", side_effect=[0.0, 0.005, 0.02]):
+            daemon._serve_connection(connection)
+        response = json.loads(connection.sendall.call_args.args[0])
+        self.assertFalse(response["ok"])
+        self.assertIn("deadline", response["error"])
 
 
 if __name__ == "__main__":

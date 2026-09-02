@@ -15,7 +15,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
+
+MAX_SYSFS_TEXT_BYTES = 4096
+MAX_ERROR_CHARS = 512
+
+
+def bounded_plain_text(value: object, limit: int = MAX_ERROR_CHARS) -> str:
+    """Return one bounded line without control or markup-significant characters."""
+    text = "".join(
+        " " if ord(character) < 32 or 127 <= ord(character) <= 159 else character
+        for character in str(value)
+    )
+    return " ".join(text.split()).replace("<", "").replace(">", "").replace("&", "")[:limit]
 
 
 class NitroError(RuntimeError):
@@ -38,7 +50,11 @@ class NitroHardware:
 
     def _text(self, path: Path) -> str:
         try:
-            return path.read_text(encoding="utf-8").strip()
+            with path.open("r", encoding="utf-8") as stream:
+                value = stream.read(MAX_SYSFS_TEXT_BYTES + 1)
+            if len(value) > MAX_SYSFS_TEXT_BYTES:
+                return ""
+            return bounded_plain_text(value, MAX_SYSFS_TEXT_BYTES)
         except (OSError, UnicodeError):
             return ""
 
@@ -298,6 +314,8 @@ class NitroHardware:
 
 class NitroDaemon:
     MAX_REQUEST_BYTES = 8192
+    MAX_RESPONSE_BYTES = 32768
+    TOTAL_REQUEST_SECONDS = 3.0
 
     def __init__(
         self,
@@ -325,6 +343,13 @@ class NitroDaemon:
             "3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
         )
         return uid in {0, self.access_uid}
+
+    @classmethod
+    def _encoded_response(cls, response: dict[str, Any]) -> bytes:
+        encoded = json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n"
+        if len(encoded) > cls.MAX_RESPONSE_BYTES:
+            return b'{"ok":false,"error":"backend response exceeded safety limit"}\n'
+        return encoded
 
     def _response(self, request: dict[str, Any]) -> dict[str, Any]:
         action = str(request.get("action", "status"))
@@ -360,8 +385,13 @@ class NitroDaemon:
         else:
             try:
                 raw = b""
+                deadline = time.monotonic() + self.TOTAL_REQUEST_SECONDS
                 while b"\n" not in raw and len(raw) <= self.MAX_REQUEST_BYTES:
-                    chunk = conn.recv(2048)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("request deadline exceeded")
+                    conn.settimeout(remaining)
+                    chunk = conn.recv(min(2048, self.MAX_REQUEST_BYTES + 1 - len(raw)))
                     if not chunk:
                         break
                     raw += chunk
@@ -371,12 +401,19 @@ class NitroDaemon:
                 if not isinstance(request, dict):
                     raise NitroError("request must be a JSON object")
                 response = self._response(request)
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError, NitroError) as exc:
-                response = {"ok": False, "error": str(exc)}
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                TimeoutError,
+                json.JSONDecodeError,
+                NitroError,
+            ) as exc:
+                response = {"ok": False, "error": bounded_plain_text(exc)}
             except Exception as exc:  # keep the safety daemon alive on unexpected input
                 print(f"nitro-control: unexpected request failure: {exc}", file=sys.stderr, flush=True)
                 response = {"ok": False, "error": "internal backend error"}
-        conn.sendall(json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n")
+        conn.sendall(self._encoded_response(response))
 
     def _check_watchdog(self) -> None:
         if self.manual_deadline is None:

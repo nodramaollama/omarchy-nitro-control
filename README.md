@@ -34,11 +34,17 @@ See the [plain-English compatibility guide](docs/compatibility.md) for details.
 
 No reboot or logout is normally needed.
 
-The root installer is a readable shell script. It installs the backend under
-`/usr/lib/nitro-control`, the `nitroctl` client under `/usr/bin`, and one
-systemd service. On the exact tested ANV16-71 kernel and BIOS only, it may also
-install the checksummed DKMS fallback. If DKMS or kernel headers are missing,
-Arch's package manager installs them from the normal system repositories.
+The root installer first copies an exact, digest-verified release payload into
+a root-owned, no-follow snapshot. Privileged installation reads only from that
+snapshot. It installs the backend under `/usr/lib/nitro-control`, the
+`nitroctl` client under `/usr/bin`, and one systemd service. On the exact tested
+ANV16-71 kernel and BIOS only, it may also install the checksummed DKMS
+fallback.
+
+DKMS setup is an explicit manual prerequisite. If the installer reports that
+DKMS or matching kernel headers are absent, install the named packages with
+`omarchy pkg add`, then run **Install system support** again. The plugin never
+runs a package manager as root.
 
 ## Use
 
@@ -66,6 +72,10 @@ nitroctl automatic
 - Manual mode needs a heartbeat from the widget.
 - If the widget or service stops, the fans return to Automatic.
 - Unsupported models remain read-only.
+- Every privileged release artifact is bound to `release-manifest.sha256`.
+- Installation is transactional: a late failure restores the previous files,
+  service state, and DKMS state.
+- UI subprocesses have deadlines, bounded output, and plain-text display.
 
 Read [Safety](docs/safety.md) for the full design.
 
@@ -93,14 +103,19 @@ embedded-controller registers from a similar laptop.
 omarchy plugin remove nitro.control
 ```
 
-The uninstaller returns the fans to Automatic before removing system support.
+The uninstaller returns the fans to Automatic and confirms the hardware state
+before removing system support. If that cannot be confirmed, it leaves the
+service and driver in place and stops with recovery instructions.
 
 ## Verify a release
 
-Release tags are signed. After cloning, verify v1 with:
+Release tags are signed. After cloning, verify v1.0.1 and its privileged
+payload with:
 
 ```bash
-git -c gpg.ssh.allowedSignersFile=.github/release-signers verify-tag v1.0.0
+git -c gpg.ssh.allowedSignersFile=.github/release-signers verify-tag v1.0.1
+sha256sum --check --strict release-manifest.sha256
+./install --target-user "$USER" --verify-release
 ```
 
 ## Documentation

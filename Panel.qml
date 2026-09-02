@@ -18,6 +18,7 @@ Panel {
   property int cpuManual: 40
   property int gpuManual: 40
   property string page: "controls"
+  readonly property int maxProcessOutputChars: 32768
 
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string clientPath: pluginDir + "/bin/nitroctl"
@@ -34,6 +35,8 @@ Panel {
   function refresh() {
     if (statusProc.running) return
     statusProc.output = ""
+    statusProc.outputOverflow = false
+    statusProc.timedOut = false
     statusProc.command = state.mode === "manual"
       ? [clientPath, "status", "--heartbeat"]
       : [clientPath, "status"]
@@ -59,6 +62,8 @@ Panel {
     localError = ""
     actionProc.output = ""
     actionProc.errorOutput = ""
+    actionProc.outputOverflow = false
+    actionProc.timedOut = false
     actionProc.command = [clientPath].concat(arguments)
     actionProc.running = true
   }
@@ -143,36 +148,109 @@ Panel {
   Process {
     id: statusProc
     property string output: ""
+    property bool outputOverflow: false
+    property bool timedOut: false
     command: []
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8" })
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: statusProc.output = text
+      onStreamFinished: {
+        statusProc.outputOverflow = text.length > root.maxProcessOutputChars
+        statusProc.output = statusProc.outputOverflow ? "" : text
+      }
     }
-    onExited: root.consumeStatus(output)
+    onStarted: statusDeadline.restart()
+    onExited: function() {
+      statusDeadline.stop()
+      statusKillDeadline.stop()
+      if (timedOut) {
+        root.statusReady = true
+        root.localError = "Status request timed out"
+      } else if (outputOverflow) {
+        root.statusReady = true
+        root.localError = "Status response exceeded safety limit"
+      } else {
+        root.consumeStatus(output)
+      }
+    }
   }
 
   Process {
     id: actionProc
     property string output: ""
     property string errorOutput: ""
+    property bool outputOverflow: false
+    property bool timedOut: false
     command: []
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8" })
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: actionProc.output = text
+      onStreamFinished: {
+        actionProc.outputOverflow = text.length > root.maxProcessOutputChars
+        actionProc.output = actionProc.outputOverflow ? "" : text
+      }
     }
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: actionProc.errorOutput = text
+      onStreamFinished: actionProc.errorOutput = Model.plainText(text, 512)
     }
+    onStarted: actionDeadline.restart()
     onExited: function(exitCode) {
+      actionDeadline.stop()
+      actionKillDeadline.stop()
+      if (timedOut) {
+        root.localError = "Control action timed out"
+        root.refresh()
+        return
+      }
+      if (outputOverflow) {
+        root.localError = "Control response exceeded safety limit"
+        root.refresh()
+        return
+      }
       var next = Model.parseStatus(output, root.state)
       if (exitCode === 0 && next.ok) {
         root.consumeStatus(output)
       } else {
-        root.localError = next.error || errorOutput.trim() || "Control action failed"
+        root.localError = next.error || Model.plainText(errorOutput, 512) || "Control action failed"
         root.refresh()
       }
     }
+  }
+
+  Timer {
+    id: statusDeadline
+    interval: 3000
+    repeat: false
+    onTriggered: if (statusProc.running) {
+      statusProc.timedOut = true
+      statusProc.signal(15)
+      statusKillDeadline.restart()
+    }
+  }
+  Timer {
+    id: statusKillDeadline
+    interval: 750
+    repeat: false
+    onTriggered: if (statusProc.running) statusProc.signal(9)
+  }
+  Timer {
+    id: actionDeadline
+    interval: 5000
+    repeat: false
+    onTriggered: if (actionProc.running) {
+      actionProc.timedOut = true
+      actionProc.signal(15)
+      actionKillDeadline.restart()
+    }
+  }
+  Timer {
+    id: actionKillDeadline
+    interval: 750
+    repeat: false
+    onTriggered: if (actionProc.running) actionProc.signal(9)
   }
 
   Timer {
@@ -241,6 +319,7 @@ Panel {
             iconComponent: Component {
               Text {
                 text: root.state.mode === "maximum" ? "󰈸" : "󰈐"
+                textFormat: Text.PlainText
                 color: root.contentForeground
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.display
@@ -299,6 +378,7 @@ Panel {
                 text: root.state.controlAvailable
                   ? "Sensors are working. Install the safety backend to unlock controls."
                   : "Install verified kernel support and the safety backend. Unknown models remain read-only."
+                textFormat: Text.PlainText
                 color: root.contentForeground
                 opacity: 0.72
                 font.family: root.contentFontFamily
@@ -393,6 +473,7 @@ Panel {
                 Text {
                   width: parent.width
                   text: "Manual control returns to Automatic if this plugin stops responding."
+                  textFormat: Text.PlainText
                   wrapMode: Text.WordWrap
                   color: root.contentForeground
                   opacity: 0.58
@@ -456,6 +537,7 @@ Panel {
               visible: root.localError !== ""
               width: parent.width
               text: root.localError
+              textFormat: Text.PlainText
               wrapMode: Text.WordWrap
               color: root.bar ? root.bar.urgent : Color.urgent
               font.family: root.contentFontFamily
@@ -531,6 +613,7 @@ Panel {
             Text {
               width: parent.width
               text: "The 20% safety floor and 12-second Automatic fallback are enforced by the system service and cannot be disabled here."
+              textFormat: Text.PlainText
               wrapMode: Text.WordWrap
               color: root.contentForeground
               opacity: 0.58
@@ -569,6 +652,7 @@ Panel {
       Text {
         anchors.horizontalCenter: parent.horizontalCenter
         text: title
+        textFormat: Text.PlainText
         color: Qt.darker(root.contentForeground, 1.4)
         font.family: root.contentFontFamily
         font.pixelSize: Style.font.caption
@@ -578,6 +662,7 @@ Panel {
       Text {
         anchors.horizontalCenter: parent.horizontalCenter
         text: temperatureText
+        textFormat: Text.PlainText
         color: root.contentForeground
         font.family: root.contentFontFamily
         font.pixelSize: Style.font.title
@@ -586,6 +671,7 @@ Panel {
       Text {
         anchors.horizontalCenter: parent.horizontalCenter
         text: fanText
+        textFormat: Text.PlainText
         color: root.contentForeground
         opacity: 0.65
         font.family: root.contentFontFamily
@@ -607,6 +693,7 @@ Panel {
       width: parent.width
       Text {
         text: label
+        textFormat: Text.PlainText
         color: root.contentForeground
         font.family: root.contentFontFamily
         font.pixelSize: Style.font.bodySmall
@@ -617,6 +704,7 @@ Panel {
       }
       Text {
         text: value + "%"
+        textFormat: Text.PlainText
         color: root.contentForeground
         font.family: root.contentFontFamily
         font.pixelSize: Style.font.bodySmall
